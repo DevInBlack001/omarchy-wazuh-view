@@ -25,6 +25,7 @@ Panel {
   property int activeTab: 0
 
   readonly property bool installed: !!(payload && payload.installed === true)
+  readonly property string blockedPath: (payload && payload.blockedPath) ? payload.blockedPath : ""
   readonly property var connectionData: payload ? payload.connection : null
   readonly property var configData: payload ? payload.config : null
   readonly property var scaData: payload ? payload.sca : null
@@ -187,6 +188,7 @@ Panel {
             implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
             Text {
+              textFormat: Text.PlainText
               id: heroIcon
               text: ""  // nf-fa-shield
               color: root.statusColor(root.overallStatus)
@@ -205,6 +207,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                textFormat: Text.PlainText
                 text: "Wazuh View"
                 color: root.bar.foreground
                 font.family: root.bar.fontFamily
@@ -215,6 +218,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 text: root.summary.label
                 color: root.statusColor(root.overallStatus)
                 font.family: root.bar.fontFamily
@@ -236,8 +240,13 @@ Panel {
             visible: !root.installed
 
             Text {
-              text: root.payload ? "No Wazuh agent detected on this machine." : (root.loadFailed ? "Failed to read agent state." : "Checking for a local Wazuh agent...")
-              color: Qt.darker(root.bar.foreground, 1.4)
+              textFormat: Text.PlainText
+              text: {
+                if (!root.payload) return root.loadFailed ? "Failed to read agent state." : "Checking for a local Wazuh agent..."
+                if (root.blockedPath) return "Wazuh agent found at " + root.blockedPath + ", but this user can't read it."
+                return "No Wazuh agent detected on this machine."
+              }
+              color: root.blockedPath ? root.statusColor("warn") : Qt.darker(root.bar.foreground, 1.4)
               font.family: root.bar.fontFamily
               font.pixelSize: Style.font.body
               wrapMode: Text.WordWrap
@@ -245,7 +254,19 @@ Panel {
             }
 
             Text {
-              visible: !!root.payload && !root.installed
+              textFormat: Text.PlainText
+              visible: !!root.payload && !root.installed && !!root.blockedPath
+              text: "Run: sudo usermod -aG wazuh $USER, then log out and back in (group membership only takes effect for a new session)."
+              color: Qt.darker(root.bar.foreground, 1.6)
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+              width: parent.width
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: !!root.payload && !root.installed && !root.blockedPath
               text: "Set WAZUH_HOME if the agent lives outside /var/ossec or /opt/ossec."
               color: Qt.darker(root.bar.foreground, 1.6)
               font.family: root.bar.fontFamily
@@ -310,6 +331,7 @@ Panel {
               visible: !!root.moduleStatusData
 
               Text {
+                textFormat: Text.PlainText
                 text: "PROCESSES"
                 color: Qt.darker(root.bar.foreground, 1.6)
                 font.family: root.bar.fontFamily
@@ -337,6 +359,7 @@ Panel {
             visible: root.installed && root.activeTab === 1
 
             Text {
+              textFormat: Text.PlainText
               visible: !root.scaData || !root.scaData.readable
               text: root.scaData ? Model.errorLabel(root.scaData.error) : "Loading..."
               color: Qt.darker(root.bar.foreground, 1.4)
@@ -384,6 +407,7 @@ Panel {
                   spacing: Style.space(2)
 
                   Text {
+                    textFormat: Text.PlainText
                     text: checkCard.modelData.title || "Untitled check"
                     color: Color.accent
                     font.family: root.bar.fontFamily
@@ -394,6 +418,7 @@ Panel {
                   }
 
                   Text {
+                    textFormat: Text.PlainText
                     visible: !!checkCard.modelData.remediation
                     text: checkCard.modelData.remediation || ""
                     color: Qt.darker(root.bar.foreground, 1.3)
@@ -406,6 +431,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 visible: root.scaFailed.length === 0 && root.scaScans.length > 0
                 text: "No failed checks in the local database."
                 color: Qt.darker(root.bar.foreground, 1.4)
@@ -422,6 +448,7 @@ Panel {
             visible: root.installed && root.activeTab === 2
 
             Text {
+              textFormat: Text.PlainText
               visible: !root.fimData || !root.fimData.readable
               text: root.fimData ? Model.errorLabel(root.fimData.error) : "Loading..."
               color: Qt.darker(root.bar.foreground, 1.4)
@@ -445,6 +472,7 @@ Panel {
                 visible: root.fimSample.length > 0
 
                 Text {
+                  textFormat: Text.PlainText
                   text: "SAMPLE"
                   color: Qt.darker(root.bar.foreground, 1.6)
                   font.family: root.bar.fontFamily
@@ -456,6 +484,7 @@ Panel {
                   model: root.fimSample.slice(0, 50)
 
                   Text {
+                    textFormat: Text.PlainText
                     required property var modelData
                     text: modelData
                     color: root.bar.foreground
@@ -480,6 +509,7 @@ Panel {
             KeyValueRow { k: "Recent activity (log lines)"; v: Model.fieldOrDash(root.rootcheckData ? root.rootcheckData.recentCount : null) }
 
             Text {
+              textFormat: Text.PlainText
               text: (root.rootcheckData && root.rootcheckData.error) ? Model.errorLabel(root.rootcheckData.error) : ("Last activity: " + Model.fieldOrDash(root.rootcheckData ? root.rootcheckData.lastLine : null))
               color: Qt.darker(root.bar.foreground, 1.3)
               font.family: root.bar.fontFamily
@@ -489,6 +519,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               text: "Detailed rootkit and anomaly findings are kept on the manager. This panel only shows local agent log activity."
               color: Qt.darker(root.bar.foreground, 1.6)
               font.family: root.bar.fontFamily
@@ -505,6 +536,7 @@ Panel {
             visible: root.installed && root.activeTab === 4
 
             Text {
+              textFormat: Text.PlainText
               visible: !root.configData || !root.configData.readable
               text: root.configData ? Model.errorLabel(root.configData.error) : "Loading..."
               color: Qt.darker(root.bar.foreground, 1.4)
@@ -545,6 +577,7 @@ Panel {
               Repeater {
                 model: root.scaPolicyNames
                 Text {
+                  textFormat: Text.PlainText
                   required property var modelData
                   text: modelData
                   color: root.bar.foreground
@@ -576,6 +609,7 @@ Panel {
             visible: root.installed && root.activeTab === 5
 
             Text {
+              textFormat: Text.PlainText
               visible: !root.logsData || !root.logsData.readable
               text: root.logsData ? Model.errorLabel(root.logsData.error) : "Loading..."
               color: Qt.darker(root.bar.foreground, 1.4)
@@ -591,6 +625,7 @@ Panel {
               visible: !!(root.logsData && root.logsData.readable)
 
               Text {
+                textFormat: Text.PlainText
                 text: (root.logsData ? root.logsData.errorCount : 0) + " errors, " + (root.logsData ? root.logsData.warnCount : 0) + " warnings in view"
                 color: Qt.darker(root.bar.foreground, 1.4)
                 font.family: root.bar.fontFamily
@@ -601,6 +636,7 @@ Panel {
                 model: root.logEntries
 
                 Text {
+                  textFormat: Text.PlainText
                   required property var modelData
                   text: modelData.text
                   color: (modelData.level === "ERROR" || modelData.level === "CRITICAL") ? root.bar.urgent : (modelData.level === "WARNING" ? Color.accent : Qt.darker(root.bar.foreground, 1.2))
@@ -629,6 +665,7 @@ Panel {
     implicitHeight: kText.implicitHeight
 
     Text {
+      textFormat: Text.PlainText
       id: kText
       text: parent.k
       color: Qt.darker(root.bar.foreground, 1.4)
@@ -641,6 +678,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       text: parent.v
       color: parent.vColor
       font.family: root.bar.fontFamily
@@ -664,6 +702,7 @@ Panel {
     color: root.activeTab === index ? Qt.darker(root.bar.foreground, 4) : "transparent"
 
     Text {
+      textFormat: Text.PlainText
       id: tabLabel
       anchors.centerIn: parent
       text: tabButton.label

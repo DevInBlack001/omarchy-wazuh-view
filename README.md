@@ -2,6 +2,8 @@
 
 Local Wazuh agent status for the [Omarchy](https://omarchy.org/) Quickshell bar. SCA policy results, FIM baseline, rootcheck activity, effective configuration, and recent agent log lines, all inside the bar, no separate GUI window.
 
+![Preview](preview.png)
+
 This plugin talks only to the local agent's own files and databases. It does not connect to a Wazuh manager or the Wazuh API, so it works even on an agent that has never reported to a manager, and it never sends anything anywhere.
 
 ## Features

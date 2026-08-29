@@ -54,7 +54,11 @@ function worstStatus(statuses) {
 
 function summarize(payload) {
   if (!payload) return { status: "unknown", label: "LOADING" }
-  if (payload.installed === false) return { status: "unknown", label: "AGENT NOT DETECTED" }
+  if (payload.installed === false) {
+    return payload.blockedPath
+      ? { status: "warn", label: "AGENT FOUND, NOT READABLE" }
+      : { status: "unknown", label: "AGENT NOT DETECTED" }
+  }
 
   var statuses = [
     connectionStatus(payload.connection),
