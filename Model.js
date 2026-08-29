@@ -7,6 +7,7 @@ function errorLabel(code) {
     permission_denied: "Permission denied, add your user to the wazuh group",
     not_found: "Not available yet",
     read_error: "Could not read local data",
+    locked: "Database busy, the agent is writing to it right now",
   }
   return map[code] || "Unknown error"
 }

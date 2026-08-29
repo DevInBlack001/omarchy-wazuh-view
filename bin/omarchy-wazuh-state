@@ -251,6 +251,12 @@ def db_error_code(exc):
     message = str(exc).lower()
     if "unable to open database file" in message or "permission denied" in message:
         return "permission_denied"
+    if "locked" in message or "busy" in message:
+        # The real agent daemon actively writes these databases (a fresh
+        # FIM baseline scan alone briefly held a multi-second write lock
+        # on a 46 MB database in testing), so a transient lock here is
+        # expected agent activity, not a fault.
+        return "locked"
     return "read_error"
 
 
@@ -344,13 +350,21 @@ def config(agent_home):
                 if policy_el.text and policy_el.text.strip() and len(sca_policies) < MAX_LIST:
                     sca_policies.append(clip(policy_el.text.strip()))
 
+    # <active-response> is overloaded in ossec.conf: the same tag is used
+    # both for the global settings block (disabled, ca_store, ...) and for
+    # a specific command binding (disabled, command, location, ...). Only
+    # the latter is a real AR entry; a block with no <command> is the
+    # global block and would otherwise show up as a binding with an empty
+    # command.
     active_responses = []
     for el in ar_elems:
         command = el.findtext("command")
+        if not (command and command.strip()):
+            continue
         disabled = el.findtext("disabled")
         if len(active_responses) < MAX_LIST:
             active_responses.append({
-                "command": clip((command or "").strip()),
+                "command": clip(command.strip()),
                 "enabled": not (disabled and disabled.strip().lower() in ("yes", "true", "1")),
             })
 
@@ -497,7 +511,7 @@ def fim(agent_home):
 
         result["readable"] = True
 
-        path_table = find_table(tables, ["entry_path", "path"])
+        path_table = find_table(tables, ["entry_path", "file_entry", "path"])
         if path_table:
             result["monitoredCount"] = cur.execute(
                 "SELECT COUNT(*) FROM " + quote_ident(path_table)).fetchone()[0]
@@ -589,24 +603,59 @@ def agent_state(agent_home):
 
 
 def version(agent_home):
+    # Newer agent builds ship VERSION.json ({"version": "4.14.7", "stage":
+    # "rc1", ...)) instead of the older plain-text VERSION file. Try the
+    # newer format first, fall back to the old one.
+    json_text, _ = read_text(os.path.join(agent_home, "VERSION.json"), MAX_VERSION_BYTES)
+    if json_text:
+        try:
+            data = json.loads(json_text)
+            v = data.get("version")
+            if isinstance(v, str) and v.strip():
+                stage = data.get("stage")
+                if isinstance(stage, str) and stage.strip():
+                    return clip(v.strip() + " (" + stage.strip() + ")", 100)
+                return clip(v.strip(), 100)
+        except Exception:
+            pass
+
     text, _ = read_text(os.path.join(agent_home, "VERSION"), MAX_VERSION_BYTES)
-    return text.strip() if text else None
+    return clip(text.strip(), 100) if text else None
+
+
+AGENT_DAEMON_NAMES = ("wazuh-agentd", "wazuh-execd", "wazuh-logcollector",
+                      "wazuh-modulesd", "wazuh-syscheckd")
 
 
 def module_status(agent_home):
-    control_bin = os.path.join(agent_home, "bin", "wazuh-control")
-    if not (os.path.isfile(control_bin) and os.access(control_bin, os.X_OK)):
+    # Deliberately not `wazuh-control status`: that command takes the same
+    # start-script-lock used for actual start/stop/restart, not one meant
+    # for repeated read-only polling. A monitoring plugin calling it every
+    # refresh risks contending with a real start/stop/restart (confirmed:
+    # running it manually while this plugin was polling produced "ERROR:
+    # Another instance is locking this process"). Reading /proc directly
+    # needs no lock and no subprocess. /proc/PID/comm truncates to 15
+    # bytes (wazuh-logcollector would come back as wazuh-logcollec), so
+    # this reads argv[0] from cmdline instead.
+    running = set()
+    try:
+        for pid_dir in os.listdir("/proc"):
+            if not pid_dir.isdigit():
+                continue
+            try:
+                with open(os.path.join("/proc", pid_dir, "cmdline"), "rb") as f:
+                    raw = f.read(4096)
+            except OSError:
+                continue
+            if not raw:
+                continue
+            argv0 = raw.split(b"\x00", 1)[0]
+            name = os.path.basename(argv0.decode("utf-8", "replace"))
+            if name in AGENT_DAEMON_NAMES:
+                running.add(name)
+    except OSError:
         return None
-    output = run([control_bin, "status"])
-    if not output:
-        return None
-    statuses = {}
-    line_pattern = re.compile(r"^(\S+)\s+is\s+(running|not running)")
-    for line in output.splitlines()[:50]:
-        match = line_pattern.match(line.strip())
-        if match:
-            statuses[match.group(1)] = match.group(2) == "running"
-    return statuses
+    return {name: (name in running) for name in AGENT_DAEMON_NAMES}
 
 
 def safe(fn, default=None):
