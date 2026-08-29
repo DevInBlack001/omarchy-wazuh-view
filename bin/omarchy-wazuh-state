@@ -98,19 +98,33 @@ def run(cmd, timeout=4, limit=MAX_SUBPROCESS_BYTES):
     return b"".join(chunks)[:limit].decode("utf-8", "replace")
 
 
+def open_nofollow(path):
+    # O_NOFOLLOW rejects the open with ELOOP if the final path component is
+    # a symlink, so a symlink planted where an agent file is expected (e.g.
+    # logs/ossec.log pointed at something outside the agent tree) can't
+    # redirect a read into content the panel never meant to display. This
+    # only guards the final component, not an intermediate directory in the
+    # path, which is enough here since every path this script reads is a
+    # fixed, well-known name directly under the already-verified agent home.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    return os.fdopen(fd, "rb")
+
+
 def read_text(path, limit):
     # Bounded read of a regular file. Returns (text, None) on success or
     # (None, code) on failure, where code is one of a small fixed set the
     # UI layer maps to a friendly message, rather than a raw exception
     # string that could vary between platforms.
     try:
-        with open(path, "rb") as f:
+        with open_nofollow(path) as f:
             data = f.read(limit)
         return data.decode("utf-8", "replace"), None
     except PermissionError:
         return None, "permission_denied"
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return None, "not_found"
+    except OSError:
+        return None, "read_error"
     except Exception:
         return None, "read_error"
 
@@ -126,12 +140,14 @@ def tail_lines(path, max_lines, max_bytes):
         return None, "read_error"
 
     try:
-        with open(path, "rb") as f:
+        with open_nofollow(path) as f:
             start = max(0, size - max_bytes)
             f.seek(start)
             data = f.read(max_bytes)
     except PermissionError:
         return None, "permission_denied"
+    except OSError:
+        return None, "read_error"
     except Exception:
         return None, "read_error"
 
@@ -219,6 +235,14 @@ def open_readonly_db(path):
     # percent-encoded before being placed in the URI so a filename holding
     # a character SQLite's URI parser treats as a delimiter (?, #, %) can't
     # change which file, or which mode, actually gets opened.
+    #
+    # glob() lists a symlink the same as a regular file, and SQLite's own
+    # open follows symlinks, so a symlink planted under queue/sca/db or
+    # queue/fim/db (matching *.db) could otherwise redirect this open at
+    # some other file. Reject it up front rather than trusting SQLite's
+    # opener to only ever see what glob intended.
+    if os.path.islink(path):
+        raise OSError("refusing to open a symlink: " + path)
     encoded = urllib.parse.quote(path)
     return sqlite3.connect("file:" + encoded + "?mode=ro", uri=True, timeout=2)
 
