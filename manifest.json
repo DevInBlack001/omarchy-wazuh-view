@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "devinblack001.wazuh-view",
+  "name": "Wazuh View",
+  "version": "1.0.0",
+  "author": "DevInBlack001",
+  "license": "MIT",
+  "description": "Local Wazuh agent status in the bar: SCA, FIM, rootcheck, config, and log health, all read-only, no manager or API required",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Wazuh View",
+    "description": "SCA policy results, FIM baseline, rootcheck activity, effective config, and recent agent log lines from the local Wazuh agent",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

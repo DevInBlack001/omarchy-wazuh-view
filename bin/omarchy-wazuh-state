@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+# Reads local Wazuh agent state (config, SCA, FIM, rootcheck, logs, connection
+# status) and prints one JSON blob on stdout. Read-only, no writes to any
+# agent file or database, no network calls, no manager or API required.
+# Never reads etc/client.keys: that file holds the agent's shared auth key
+# and is intentionally out of scope for this plugin.
+
+import glob
+import json
+import os
+import re
+import select
+import sqlite3
+import subprocess
+import time
+import xml.etree.ElementTree as ET
+
+MAX_SUBPROCESS_BYTES = 65536
+MAX_CONFIG_BYTES = 2 * 1024 * 1024
+MAX_STATE_BYTES = 65536
+MAX_VERSION_BYTES = 256
+MAX_LOG_TAIL_BYTES = 131072
+MAX_LOG_LINES = 60
+MAX_ROOTCHECK_TAIL_BYTES = 262144
+MAX_ROOTCHECK_LINES = 400
+MAX_LOG_LINE_LEN = 400
+MAX_LIST = 100
+MAX_POLICIES = 50
+MAX_FAILED_CHECKS = 200
+MAX_FIM_SAMPLE = 200
+
+
+def run(cmd, timeout=4, limit=MAX_SUBPROCESS_BYTES):
+    # Reads the child's stdout through a nonblocking fd with an explicit
+    # byte cap and deadline instead of subprocess.run(capture_output=True),
+    # which buffers everything before we get a chance to bound it. The
+    # command is always an absolute path resolved under the detected agent
+    # install, passed as an argv list, never through a shell.
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ""
+
+    chunks = []
+    total = 0
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    deadline = time.monotonic() + timeout
+    try:
+        while total < limit:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], min(0.2, remaining))
+            if not ready:
+                continue
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.stdout.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+    return b"".join(chunks)[:limit].decode("utf-8", "replace")
+
+
+def read_text(path, limit):
+    # Bounded read of a regular file. Returns (text, None) on success or
+    # (None, code) on failure, where code is one of a small fixed set the
+    # UI layer maps to a friendly message, rather than a raw exception
+    # string that could vary between platforms.
+    try:
+        with open(path, "rb") as f:
+            data = f.read(limit)
+        return data.decode("utf-8", "replace"), None
+    except PermissionError:
+        return None, "permission_denied"
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None, "not_found"
+    except Exception:
+        return None, "read_error"
+
+
+def tail_lines(path, max_lines, max_bytes):
+    try:
+        size = os.path.getsize(path)
+    except PermissionError:
+        return None, "permission_denied"
+    except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+        return None, "not_found"
+    except Exception:
+        return None, "read_error"
+
+    try:
+        with open(path, "rb") as f:
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read(max_bytes)
+    except PermissionError:
+        return None, "permission_denied"
+    except Exception:
+        return None, "read_error"
+
+    text = data.decode("utf-8", "replace")
+    lines = text.splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]
+    return lines[-max_lines:], None
+
+
+def resolve_agent_home():
+    # No path is hardcoded and used directly; every candidate is verified
+    # (has bin/ and etc/ossec.conf) before it is trusted, and every later
+    # lookup in this script builds its path from the returned value.
+    candidates = []
+    for env_name in ("WAZUH_HOME", "OSSEC_HOME"):
+        value = os.environ.get(env_name)
+        if value:
+            candidates.append(value)
+    candidates.extend(["/var/ossec", "/opt/ossec"])
+
+    seen = set()
+    for candidate in candidates:
+        normalized = os.path.normpath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if os.path.isfile(os.path.join(normalized, "etc", "ossec.conf")) and \
+           os.path.isdir(os.path.join(normalized, "bin")):
+            return normalized
+    return None
+
+
+def quote_ident(name):
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def find_table(tables, preferred_substrings):
+    lower_map = {t.lower(): t for t in tables}
+    for sub in preferred_substrings:
+        for lower, original in lower_map.items():
+            if sub in lower:
+                return original
+    return None
+
+
+def pick_column(columns, *substrings):
+    lower_map = {c.lower(): c for c in columns}
+    for sub in substrings:
+        for lower, original in lower_map.items():
+            if sub in lower:
+                return original
+    return None
+
+
+def table_columns(cur, table):
+    cur.execute("PRAGMA table_info(" + quote_ident(table) + ")")
+    return [row[1] for row in cur.fetchall()]
+
+
+def open_readonly_db(path):
+    # URI mode=ro asks SQLite to refuse any write, as a second guard on top
+    # of never issuing an INSERT/UPDATE/DELETE, so a bug here can't corrupt
+    # a database the running wazuh-agentd process depends on.
+    return sqlite3.connect("file:" + path + "?mode=ro", uri=True, timeout=2)
+
+
+def db_error_code(exc):
+    message = str(exc).lower()
+    if "unable to open database file" in message or "permission denied" in message:
+        return "permission_denied"
+    return "read_error"
+
+
+# ------------------------------------------------------------------ config --
+
+def parse_xml_blocks(text):
+    # ossec.conf is a sequence of possibly several <ossec_config> blocks
+    # concatenated one after another, which is not well-formed XML on its
+    # own. Wrapping in a synthetic root lets the standard library parser
+    # read it without guessing at a custom grammar.
+    if not text:
+        return None
+    try:
+        return ET.fromstring("<root>" + text + "</root>")
+    except ET.ParseError:
+        return None
+
+
+def config(agent_home):
+    main_path = os.path.join(agent_home, "etc", "ossec.conf")
+    main_text, error = read_text(main_path, MAX_CONFIG_BYTES)
+    if main_text is None:
+        return {"readable": False, "error": error, "modules": {}, "fimDirs": [],
+                "logFiles": [], "scaPolicies": [], "activeResponses": [], "manager": None,
+                "sharedConfigPresent": False}
+
+    main_root = parse_xml_blocks(main_text)
+    shared_path = os.path.join(agent_home, "etc", "shared", "agent.conf")
+    shared_text, _ = read_text(shared_path, MAX_CONFIG_BYTES)
+    shared_root = parse_xml_blocks(shared_text) if shared_text else None
+
+    roots = [r for r in (main_root, shared_root) if r is not None]
+    if not roots:
+        return {"readable": False, "error": "read_error", "modules": {}, "fimDirs": [],
+                "logFiles": [], "scaPolicies": [], "activeResponses": [], "manager": None,
+                "sharedConfigPresent": shared_root is not None}
+
+    def find_all(tag):
+        found = []
+        for r in roots:
+            found.extend(r.iter(tag))
+        return found
+
+    syscheck_elems = find_all("syscheck")
+    rootcheck_elems = find_all("rootcheck")
+    sca_elems = find_all("sca")
+    localfile_elems = find_all("localfile")
+    client_elems = find_all("client")
+    ar_elems = find_all("active-response")
+
+    def block_disabled(elems):
+        if not elems:
+            return None
+        for el in elems:
+            flag = el.findtext("disabled")
+            if flag is not None and flag.strip().lower() in ("yes", "true", "1"):
+                return True
+        return False
+
+    fim_dirs = []
+    for el in syscheck_elems:
+        for directory in el.findall("directories"):
+            realtime = (directory.get("realtime") or "").strip().lower() == "yes"
+            for path in (directory.text or "").split(","):
+                path = path.strip()
+                if path and len(fim_dirs) < MAX_LIST:
+                    fim_dirs.append({"path": path, "realtime": realtime})
+
+    log_files = []
+    for el in localfile_elems:
+        location = el.findtext("location")
+        log_format = el.findtext("log_format")
+        if location and len(log_files) < MAX_LIST:
+            log_files.append({"location": location.strip(), "format": (log_format or "").strip()})
+
+    sca_policies = []
+    for el in sca_elems:
+        for policies_el in el.findall("policies"):
+            for policy_el in policies_el.findall("policy"):
+                if policy_el.text and policy_el.text.strip() and len(sca_policies) < MAX_LIST:
+                    sca_policies.append(policy_el.text.strip())
+
+    active_responses = []
+    for el in ar_elems:
+        command = el.findtext("command")
+        disabled = el.findtext("disabled")
+        if len(active_responses) < MAX_LIST:
+            active_responses.append({
+                "command": (command or "").strip(),
+                "enabled": not (disabled and disabled.strip().lower() in ("yes", "true", "1")),
+            })
+
+    manager = None
+    for el in client_elems:
+        address = el.findtext("server/address")
+        if address and address.strip():
+            manager = address.strip()
+            break
+
+    return {
+        "readable": True,
+        "error": None,
+        "modules": {
+            "fim": (not block_disabled(syscheck_elems)) if syscheck_elems else None,
+            "rootcheck": (not block_disabled(rootcheck_elems)) if rootcheck_elems else None,
+            "sca": True if sca_elems else None,
+            "activeResponse": any(a["enabled"] for a in active_responses) if active_responses else None,
+        },
+        "fimDirs": fim_dirs,
+        "logFiles": log_files,
+        "scaPolicies": sca_policies,
+        "activeResponses": active_responses,
+        "manager": manager,
+        "sharedConfigPresent": shared_root is not None,
+    }
+
+
+# --------------------------------------------------------------------- sca --
+
+def sca(agent_home):
+    result = {"readable": False, "error": None, "totals": None, "failedChecks": [], "scans": []}
+    db_dir = os.path.join(agent_home, "queue", "sca", "db")
+    databases = sorted(glob.glob(os.path.join(db_dir, "*.db")))
+    if not databases:
+        result["error"] = "not_found"
+        return result
+
+    con = None
+    try:
+        con = open_readonly_db(databases[0])
+        cur = con.cursor()
+        tables = [row[0] for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+
+        result["readable"] = True
+
+        scan_table = find_table(tables, ["sca_scan_info", "scan_info"])
+        if scan_table:
+            cols = table_columns(cur, scan_table)
+            name_col = pick_column(cols, "name")
+            pass_col = pick_column(cols, "pass")
+            fail_col = pick_column(cols, "fail")
+            total_col = pick_column(cols, "total")
+            score_col = pick_column(cols, "score")
+            end_col = pick_column(cols, "end_scan", "end")
+            select_cols = [c for c in (name_col, pass_col, fail_col, total_col, score_col, end_col) if c]
+            if select_cols:
+                query = ("SELECT " + ", ".join(quote_ident(c) for c in select_cols) +
+                          " FROM " + quote_ident(scan_table) + " LIMIT ?")
+                for row in cur.execute(query, (MAX_POLICIES,)).fetchall():
+                    entry = dict(zip(select_cols, row))
+                    result["scans"].append({
+                        "name": entry.get(name_col) if name_col else None,
+                        "pass": entry.get(pass_col) if pass_col else None,
+                        "fail": entry.get(fail_col) if fail_col else None,
+                        "total": entry.get(total_col) if total_col else None,
+                        "score": entry.get(score_col) if score_col else None,
+                        "endScan": entry.get(end_col) if end_col else None,
+                    })
+
+        check_table = find_table(tables, ["sca_check", "check"])
+        if check_table:
+            cols = table_columns(cur, check_table)
+            title_col = pick_column(cols, "title")
+            result_col = pick_column(cols, "result")
+            remediation_col = pick_column(cols, "remediation")
+            rationale_col = pick_column(cols, "rationale", "description")
+            id_col = pick_column(cols, "id_check", "id")
+
+            if result_col:
+                distinct_values = [row[0] for row in cur.execute(
+                    "SELECT DISTINCT " + quote_ident(result_col) + " FROM " +
+                    quote_ident(check_table) + " LIMIT 20").fetchall()]
+
+                totals = {}
+                for value in distinct_values:
+                    if value is None:
+                        continue
+                    count = cur.execute(
+                        "SELECT COUNT(*) FROM " + quote_ident(check_table) +
+                        " WHERE " + quote_ident(result_col) + " = ?", (value,)).fetchone()[0]
+                    totals[str(value)] = count
+                result["totals"] = totals
+
+                failed_values = [v for v in distinct_values if isinstance(v, str) and "fail" in v.lower()]
+                if failed_values and title_col:
+                    select_cols = [c for c in (title_col, remediation_col, rationale_col, id_col) if c]
+                    placeholders = ",".join("?" for _ in failed_values)
+                    query = ("SELECT " + ", ".join(quote_ident(c) for c in select_cols) +
+                              " FROM " + quote_ident(check_table) +
+                              " WHERE " + quote_ident(result_col) + " IN (" + placeholders + ")" +
+                              " LIMIT ?")
+                    params = tuple(failed_values) + (MAX_FAILED_CHECKS,)
+                    for row in cur.execute(query, params).fetchall():
+                        entry = dict(zip(select_cols, row))
+                        result["failedChecks"].append({
+                            "title": entry.get(title_col),
+                            "remediation": entry.get(remediation_col) if remediation_col else None,
+                            "rationale": entry.get(rationale_col) if rationale_col else None,
+                            "id": entry.get(id_col) if id_col else None,
+                        })
+    except sqlite3.OperationalError as exc:
+        result["error"] = db_error_code(exc)
+        result["readable"] = False
+    except Exception:
+        result["error"] = "read_error"
+        result["readable"] = False
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return result
+
+
+# --------------------------------------------------------------------- fim --
+
+def fim(agent_home):
+    result = {"readable": False, "error": None, "monitoredCount": None, "sample": []}
+    db_dir = os.path.join(agent_home, "queue", "fim", "db")
+    databases = sorted(glob.glob(os.path.join(db_dir, "*.db")))
+    if not databases:
+        result["error"] = "not_found"
+        return result
+
+    con = None
+    try:
+        con = open_readonly_db(databases[0])
+        cur = con.cursor()
+        tables = [row[0] for row in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+
+        result["readable"] = True
+
+        path_table = find_table(tables, ["entry_path", "path"])
+        if path_table:
+            result["monitoredCount"] = cur.execute(
+                "SELECT COUNT(*) FROM " + quote_ident(path_table)).fetchone()[0]
+
+            cols = table_columns(cur, path_table)
+            path_col = pick_column(cols, "path") or (cols[0] if cols else None)
+            if path_col:
+                query = ("SELECT " + quote_ident(path_col) + " FROM " + quote_ident(path_table) +
+                          " ORDER BY " + quote_ident(path_col) + " LIMIT ?")
+                result["sample"] = [row[0] for row in cur.execute(query, (MAX_FIM_SAMPLE,)).fetchall()]
+    except sqlite3.OperationalError as exc:
+        result["error"] = db_error_code(exc)
+        result["readable"] = False
+    except Exception:
+        result["error"] = "read_error"
+        result["readable"] = False
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+    return result
+
+
+# --------------------------------------------------------------- rootcheck --
+
+def rootcheck(agent_home, config_result):
+    result = {"enabled": None, "lastLine": None, "recentCount": 0, "error": None}
+    if config_result and config_result.get("readable"):
+        result["enabled"] = config_result.get("modules", {}).get("rootcheck")
+
+    log_path = os.path.join(agent_home, "logs", "ossec.log")
+    lines, error = tail_lines(log_path, MAX_ROOTCHECK_LINES, MAX_ROOTCHECK_TAIL_BYTES)
+    if lines is None:
+        result["error"] = error
+        return result
+
+    matches = [line for line in lines if "rootcheck" in line.lower()]
+    result["recentCount"] = len(matches)
+    if matches:
+        result["lastLine"] = matches[-1][:MAX_LOG_LINE_LEN]
+    return result
+
+
+# -------------------------------------------------------------------- logs --
+
+def logs(agent_home):
+    result = {"readable": False, "error": None, "recent": [], "errorCount": 0, "warnCount": 0}
+    log_path = os.path.join(agent_home, "logs", "ossec.log")
+    lines, error = tail_lines(log_path, MAX_LOG_LINES, MAX_LOG_TAIL_BYTES)
+    if lines is None:
+        result["error"] = error
+        return result
+
+    result["readable"] = True
+    entries = []
+    level_pattern = re.compile(r"\b(CRITICAL|ERROR|WARNING|INFO|DEBUG)\b")
+    for line in lines:
+        match = level_pattern.search(line)
+        level = match.group(1) if match else None
+        if level in ("ERROR", "CRITICAL"):
+            result["errorCount"] += 1
+        elif level == "WARNING":
+            result["warnCount"] += 1
+        entries.append({"level": level, "text": line[:MAX_LOG_LINE_LEN]})
+    result["recent"] = entries
+    return result
+
+
+# --------------------------------------------------------------- connection --
+
+def agent_state(agent_home):
+    path = os.path.join(agent_home, "var", "run", "wazuh-agentd.state")
+    text, error = read_text(path, MAX_STATE_BYTES)
+    if text is None:
+        return {"readable": False, "error": error, "fields": {}}
+
+    fields = {}
+    line_pattern = re.compile(r"^([A-Za-z0-9_]+)='(.*)'$")
+    for line in text.splitlines()[:200]:
+        match = line_pattern.match(line.strip())
+        if match:
+            fields[match.group(1)] = match.group(2)
+    return {"readable": True, "error": None, "fields": fields}
+
+
+def version(agent_home):
+    text, _ = read_text(os.path.join(agent_home, "VERSION"), MAX_VERSION_BYTES)
+    return text.strip() if text else None
+
+
+def module_status(agent_home):
+    control_bin = os.path.join(agent_home, "bin", "wazuh-control")
+    if not (os.path.isfile(control_bin) and os.access(control_bin, os.X_OK)):
+        return None
+    output = run([control_bin, "status"])
+    if not output:
+        return None
+    statuses = {}
+    line_pattern = re.compile(r"^(\S+)\s+is\s+(running|not running)")
+    for line in output.splitlines()[:50]:
+        match = line_pattern.match(line.strip())
+        if match:
+            statuses[match.group(1)] = match.group(2) == "running"
+    return statuses
+
+
+def safe(fn, default=None):
+    # Isolates each section so one bad reading (unexpected schema, a race
+    # with the agent rotating a file, a permission edge case) degrades that
+    # section instead of crashing the whole payload.
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+def main():
+    agent_home = resolve_agent_home()
+    if not agent_home:
+        print(json.dumps({"installed": False}))
+        return
+
+    cfg = safe(lambda: config(agent_home), {
+        "readable": False, "error": "read_error", "modules": {}, "fimDirs": [],
+        "logFiles": [], "scaPolicies": [], "activeResponses": [], "manager": None,
+        "sharedConfigPresent": False,
+    })
+
+    payload = {
+        "installed": True,
+        "agentHome": agent_home,
+        "version": safe(lambda: version(agent_home)),
+        "moduleStatus": safe(lambda: module_status(agent_home)),
+        "connection": safe(lambda: agent_state(agent_home), {"readable": False, "error": "read_error", "fields": {}}),
+        "config": cfg,
+        "sca": safe(lambda: sca(agent_home), {"readable": False, "error": "read_error", "totals": None, "failedChecks": [], "scans": []}),
+        "fim": safe(lambda: fim(agent_home), {"readable": False, "error": "read_error", "monitoredCount": None, "sample": []}),
+        "rootcheck": safe(lambda: rootcheck(agent_home, cfg), {"enabled": None, "lastLine": None, "recentCount": 0, "error": None}),
+        "logs": safe(lambda: logs(agent_home), {"readable": False, "error": "read_error", "recent": [], "errorCount": 0, "warnCount": 0}),
+    }
+    print(json.dumps(payload))
+
+
+if __name__ == "__main__":
+    main()
